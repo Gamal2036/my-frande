@@ -1,3 +1,5 @@
 aiogram
 groq
 google-generativeai
+aiohttp
+beautifulsoup4
