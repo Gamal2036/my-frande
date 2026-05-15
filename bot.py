@@ -1,63 +1,99 @@
 import asyncio
 import os
+import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from aiogram import Bot, Dispatcher, types, F
-from groq import Groq
-import google.generativeai as genai
+from collections import defaultdict
+from typing import List, Dict
 
-# --- وضع المفاتيح مباشرة لحل المشكلة نهائياً ---
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.utils.chat_action import ChatActionSender
+from groq import Groq
+
+# --- الإعدادات الأساسية (Configuration) ---
 API_TOKEN = "8842786012:AAH4VmyHqjjJu_Hh0ZiAf1musjvYQRa8xP8"
 GROQ_KEY = "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"
-GEMINI_KEY = "AIzaSyDVAtKS53h8--6dCjSygv64SVmVyRO2gEg"
+MODEL_NAME = "llama-3.3-70b-versatile"
 
-# سيرفر الصحة لمنع توقف Render
-def run_health_server():
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is Healthy")
-    server = HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), Handler)
+# إعداد السجلات (Logging) لمراقبة البوت في Render
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- إدارة الذاكرة (Memory Management) ---
+class ConversationManager:
+    def __init__(self, max_history: int = 10):
+        self.history: Dict[int, List[Dict]] = defaultdict(list)
+        self.max_history = max_history
+
+    def add_message(self, user_id: int, role: str, content: str):
+        self.history[user_id].append({"role": role, "content": content})
+        if len(self.history[user_id]) > self.max_history:
+            self.history[user_id].pop(0)
+
+    def get_history(self, user_id: int) -> List[Dict]:
+        system_prompt = {
+            "role": "system", 
+            "content": "أنت مساعد ذكي محترف. تحدث بالعربية بأسلوب مهذب. تذكر سياق الحوار دائماً ولا تخرج عن اللغة العربية إلا إذا طُلب منك ذلك."
+        }
+        return [system_prompt] + self.history[user_id]
+
+chat_manager = ConversationManager(max_history=8)
+
+# --- سيرفر الصحة (Health Check Server) لضمان بقاء السحابة ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot Status: Online")
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"Health server started on port {port}")
     server.serve_forever()
 
-threading.Thread(target=run_health_server, daemon=True).start()
-
+# --- المنطق البرمجي للبوت (Bot Logic) ---
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+groq_client = Groq(api_key=GROQ_KEY)
 
-async def get_ai_response(user_text):
-    # 1. محاولة Groq (استخدام أحدث نموذج متاح Llama 3.3)
+async def call_ai(user_id: int, user_text: str) -> str:
     try:
-        client = Groq(api_key=GROQ_KEY)
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # هذا هو الأحدث والأكثر استقراراً الآن
-            messages=[{"role": "user", "content": user_text}]
+        chat_manager.add_message(user_id, "user", user_text)
+        
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=MODEL_NAME,
+            messages=chat_manager.get_history(user_id),
+            temperature=0.7,
+            max_tokens=1024
         )
-        return completion.choices[0].message.content
+        
+        ai_text = response.choices[0].message.content
+        chat_manager.add_message(user_id, "assistant", ai_text)
+        return ai_text
     except Exception as e:
-        print(f"Groq Error: {e}")
-        # 2. البديل المستقر جداً من Gemini
-        try:
-            genai.configure(api_key=GEMINI_KEY)
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content(user_text)
-            return response.text
-        except Exception as e2:
-            print(f"Gemini Error: {e2}")
-            return "⚠️ السيرفرات قيد التحديث، جرب بعد ثوانٍ قليلة."
+        logger.error(f"AI Error: {e}")
+        return "⚠️ عذراً، واجهت مشكلة فنية. هل يمكنك إعادة إرسال رسالتك؟"
 
 @dp.message(F.text)
-async def handle_msg(message: types.Message):
-    await bot.send_chat_action(message.chat.id, "typing")
-    response = await get_ai_response(message.text)
-    await message.answer(response)
+async def message_handler(message: types.Message):
+    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+        reply = await call_ai(message.from_user.id, message.text)
+        await message.answer(reply, parse_mode=ParseMode.MARKDOWN)
 
 async def main():
-    # سطر هام جداً لحل مشكلة Conflict التي تظهر في صورتك
+    # تشغيل سيرفر الصحة في الخلفية
+    threading.Thread(target=start_health_server, daemon=True).start()
+    
+    # تنظيف التحديثات القديمة وتشغيل البوت
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 البوت انطلق بالنماذج المحدثة والمفاتيح المباشرة!")
+    logger.info("Bot is starting...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
