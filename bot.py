@@ -1,17 +1,21 @@
 """
-Advanced Multi-Modal AI Telegram Bot
-=====================================
-Architecture:
-  - Aiogram 3.x for Telegram interaction
-  - Groq (Llama-3.3-70b) as primary LLM + Whisper-large-v3 for STT
-  - Gemini-1.5-Flash as fallback LLM and vision model
-  - Motor (async MongoDB) for persistent per-user conversation memory
-  - Pollinations AI for image generation (tool-use)
-  - aiohttp + BeautifulSoup for web scraping
-  - aiohttp web server on :8080 for Render health-checks
+زكي — Advanced Multi-Modal AI Telegram Bot
+===========================================
+Stack:
+  • Aiogram 3.x           — Telegram long-polling
+  • Groq Llama-3.3-70b    — primary text LLM + function-calling
+  • Groq Whisper-large-v3 — speech-to-text
+  • Gemini-1.5-Flash      — vision + LLM fallback
+  • Motor (async MongoDB)  — per-user conversation memory (last 15 msgs)
+  • Pollinations AI        — image generation (tool-use)
+  • aiohttp + BS4          — web scraping
+  • aiohttp web server     — health-check endpoint required by Render
 
-All secrets are loaded exclusively from environment variables.
+All credentials come exclusively from environment variables.
+Nothing is hard-coded.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -19,77 +23,82 @@ import json
 import logging
 import os
 import re
-import tempfile
-from typing import Any
+import signal
+import sys
+import traceback
+from typing import Optional
+from urllib.parse import quote as url_quote
 
 import aiohttp
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    BufferedInputFile,
-    Message,
-    Voice,
-)
+from aiogram.types import BufferedInputFile, Message, Voice
 from aiohttp import web
 from bs4 import BeautifulSoup
 from groq import AsyncGroq
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# ──────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════
+#  LOGGING  — stdout so Render captures every line
+# ═══════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────
-# Environment Configuration
-# ──────────────────────────────────────────────
-def _require_env(name: str) -> str:
-    """Retrieve a required environment variable or abort early with a clear error."""
-    value = os.getenv(name)
+# ═══════════════════════════════════════════════════════════
+#  ENVIRONMENT  — crash immediately with a clear message if missing
+# ═══════════════════════════════════════════════════════════
+def _require(name: str) -> str:
+    value = os.getenv(name, "").strip()
     if not value:
-        raise EnvironmentError(
-            f"Required environment variable '{name}' is not set. "
-            "Please add it to your Render environment configuration."
+        logger.critical(
+            "❌ Required environment variable '%s' is not set. "
+            "Go to Render → Your Service → Environment → Add Environment Variable.",
+            name,
         )
+        sys.exit(1)
     return value
 
 
-BOT_TOKEN: str = _require_env("BOT_TOKEN")
-GROQ_API_KEY: str = _require_env("GROQ_API_KEY")
-GEMINI_API_KEY: str = _require_env("GEMINI_API_KEY")
-MONGO_URL: str = _require_env("MONGO_URL")
+BOT_TOKEN      = _require("BOT_TOKEN")
+GROQ_API_KEY   = _require("GROQ_API_KEY")
+GEMINI_API_KEY = _require("GEMINI_API_KEY")
+MONGO_URL      = _require("MONGO_URL")
 
-GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+# Render injects $PORT at runtime.  We MUST bind to it — any other port
+# will be unreachable and Render will kill the service (exit status 1).
+PORT: int = int(os.getenv("PORT", "8080"))
+
+GROQ_TEXT_MODEL    = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL       = "gemini-1.5-flash"
+MAX_HISTORY        = 15
 
-MAX_HISTORY = 15  # messages kept per user
 
-# Render injects PORT dynamically; fall back to 8080 for local dev.
-HEALTH_PORT: int = int(os.getenv("PORT", "8080"))
+# ═══════════════════════════════════════════════════════════
+#  SYSTEM PROMPT
+# ═══════════════════════════════════════════════════════════
+SYSTEM_PROMPT = (
+    'أنت مساعد ذكاء اصطناعي متقدم واسمك "زكي". تتحدث بالعربية الفصحى بأسلوب احترافي وودي.\n'
+    "قواعدك:\n"
+    "١. تجيب دائماً بالعربية ما لم يطلب المستخدم لغة أخرى صراحةً.\n"
+    "٢. عندما يطلب المستخدم رسم أو توليد صورة، استخدم أداة generate_image فوراً.\n"
+    "٣. إذا أرسل المستخدم رابطاً، لخّص محتواه بإيجاز وأضف تحليلك.\n"
+    "٤. كن دقيقاً، مختصراً، ومفيداً. تجنب الإسهاب غير الضروري.\n"
+    "٥. لا تكشف عن مفاتيح API أو أي بيانات حساسة أبداً.\n"
+)
 
-# ──────────────────────────────────────────────
-# System Prompt
-# ──────────────────────────────────────────────
-SYSTEM_PROMPT = """أنت مساعد ذكاء اصطناعي متقدم واسمك "زكي". تتحدث بالعربية الفصحى بأسلوب احترافي وودي.
-قواعدك:
-١. تجيب دائماً بالعربية ما لم يطلب المستخدم لغة أخرى صراحةً.
-٢. عندما يطلب المستخدم رسم أو توليد صورة، استخدم أداة generate_image فوراً.
-٣. إذا أرسل المستخدم رابطاً، لخّص محتواه بإيجاز وأضف تحليلك.
-٤. كن دقيقاً، مختصراً، ومفيداً. تجنب الإسهاب غير الضروري.
-٥. لا تكشف عن مفاتيح API أو أي بيانات حساسة أبداً.
-"""
 
-# ──────────────────────────────────────────────
-# Tool Definitions (Function Calling)
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  TOOL DEFINITIONS  (Groq function-calling schema)
+# ═══════════════════════════════════════════════════════════
 TOOLS = [
     {
         "type": "function",
@@ -114,134 +123,177 @@ TOOLS = [
 ]
 
 
-# ──────────────────────────────────────────────
-# Database Manager
-# ──────────────────────────────────────────────
-class DatabaseManager:
-    """Handles persistent conversation history via MongoDB (motor)."""
+# ═══════════════════════════════════════════════════════════
+#  HEALTH SERVER
+#  Binds first so Render's probe sees a 200 before anything else starts.
+# ═══════════════════════════════════════════════════════════
+class HealthServer:
+    """
+    Minimal aiohttp HTTP server for Render uptime health checks.
 
-    def __init__(self, mongo_url: str) -> None:
+    Design:
+    - `start()` binds the port and returns immediately (non-blocking).
+      The AppRunner is stored on `self._runner` to prevent garbage-collection.
+    - `stop()` drains and cleans up the runner on graceful shutdown.
+    - Responds 200 OK to GET / and GET /health.
+    """
+
+    def __init__(self) -> None:
+        self._runner: Optional[web.AppRunner] = None
+        app = web.Application()
+        app.router.add_get("/", self._handle)
+        app.router.add_get("/health", self._handle)
+        self._app = app
+
+    @staticmethod
+    async def _handle(_: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "bot": "زكي"})
+
+    async def start(self) -> None:
+        """Bind $PORT and return.  Does NOT block the event loop."""
+        self._runner = web.AppRunner(self._app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info("✅ Health server listening on 0.0.0.0:%d", PORT)
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+            logger.info("⛔ Health server stopped.")
+
+
+# ═══════════════════════════════════════════════════════════
+#  DATABASE MANAGER
+# ═══════════════════════════════════════════════════════════
+class DatabaseManager:
+    """
+    Async MongoDB via Motor.
+
+    - Constructor is synchronous (Motor is lazy, never blocks on __init__).
+    - `connect()` issues an async ping; on failure it prints the *exact*
+      exception (not a summary) and exits so the Render log shows the cause.
+    - Every query method catches exceptions independently so one bad read
+      never takes down the bot.
+    """
+
+    def __init__(self) -> None:
         try:
             self._client = AsyncIOMotorClient(
-                mongo_url,
-                serverSelectionTimeoutMS=5_000,  # fail fast on bad URLs
+                MONGO_URL,
+                serverSelectionTimeoutMS=8_000,
+                connectTimeoutMS=8_000,
+                socketTimeoutMS=10_000,
             )
-            self._db = self._client["telegram_bot"]
-            self._collection = self._db["conversations"]
-            logger.info("✅ MongoDB client created. Connection will be verified at startup ping.")
-        except Exception as exc:
+            self._col = self._client["telegram_bot"]["conversations"]
+            logger.info("✅ MongoDB client created (lazy — not yet connected).")
+        except Exception:
             logger.critical(
-                "❌ Failed to create MongoDB client: %s  "
-                "Check your MONGO_URL environment variable on Render.",
-                exc,
+                "❌ Could not instantiate MongoDB client.\n%s",
+                traceback.format_exc(),
             )
-            raise
+            sys.exit(1)
 
     async def connect(self) -> None:
-        """Ping the server to verify the connection is alive at startup."""
+        """Verify connectivity at startup.  Exits on failure with full traceback."""
+        logger.info("⏳ Pinging MongoDB at %s ...", MONGO_URL.split("@")[-1])
         try:
             await self._client.admin.command("ping")
-            logger.info("✅ MongoDB connection verified — database is reachable.")
-        except Exception as exc:
+            logger.info("✅ MongoDB ping succeeded — database is reachable.")
+        except Exception:
             logger.critical(
-                "❌ MongoDB ping failed: %s  "
-                "The bot will exit. Fix MONGO_URL on Render and redeploy.",
-                exc,
+                "❌ MongoDB ping FAILED. Full traceback:\n%s\n"
+                "→ Check MONGO_URL in Render Environment Variables and redeploy.",
+                traceback.format_exc(),
             )
-            raise
+            sys.exit(1)
 
     async def get_history(self, user_id: int) -> list[dict]:
-        doc = await self._collection.find_one({"user_id": user_id})
-        if doc:
-            return doc.get("messages", [])
-        return []
+        try:
+            doc = await self._col.find_one({"user_id": user_id})
+            return doc.get("messages", []) if doc else []
+        except Exception:
+            logger.error("MongoDB get_history error:\n%s", traceback.format_exc())
+            return []
 
-    async def save_history(self, user_id: int, messages: list[dict]) -> None:
-        # Keep only the last MAX_HISTORY messages
-        trimmed = messages[-MAX_HISTORY:]
-        await self._collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"messages": trimmed}},
-            upsert=True,
-        )
-
-    async def append_message(self, user_id: int, role: str, content: str) -> list[dict]:
-        history = await self.get_history(user_id)
-        history.append({"role": role, "content": content})
-        await self.save_history(user_id, history)
-        return history
+    async def append_message(self, user_id: int, role: str, content: str) -> None:
+        try:
+            history = await self.get_history(user_id)
+            history.append({"role": role, "content": content})
+            await self._col.update_one(
+                {"user_id": user_id},
+                {"$set": {"messages": history[-MAX_HISTORY:]}},
+                upsert=True,
+            )
+        except Exception:
+            logger.error("MongoDB append_message error:\n%s", traceback.format_exc())
 
     async def close(self) -> None:
         self._client.close()
+        logger.info("⛔ MongoDB connection closed.")
 
 
-# ──────────────────────────────────────────────
-# Image Generator (Pollinations AI)
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  IMAGE GENERATOR  (Pollinations AI — free, no key needed)
+# ═══════════════════════════════════════════════════════════
 class ImageGenerator:
-    """Generates images using the free Pollinations.ai API."""
+    """
+    Uses stdlib urllib.parse.quote instead of aiohttp's private
+    helpers.quote, which was removed in aiohttp ≥ 3.9.
+    """
 
-    BASE_URL = "https://image.pollinations.ai/prompt/{prompt}"
+    _BASE = "https://image.pollinations.ai/prompt/{prompt}"
 
     async def generate(self, prompt: str) -> bytes:
-        encoded = aiohttp.helpers.quote(prompt, safe="")
-        url = self.BASE_URL.format(prompt=encoded)
+        url = self._BASE.format(prompt=url_quote(prompt, safe=""))
         params = {"width": 1024, "height": 1024, "nologo": "true", "enhance": "true"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as s:
+            async with s.get(url, params=params) as resp:
                 resp.raise_for_status()
                 return await resp.read()
 
 
-# ──────────────────────────────────────────────
-# Web Scraper
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  WEB SCRAPER
+# ═══════════════════════════════════════════════════════════
 class WebScraper:
-    """Fetches and cleans textual content from URLs."""
-
-    MAX_CHARS = 4000
+    _MAX = 4_000
 
     async def fetch(self, url: str) -> str:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ZakiBot/2.0)"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+            async with s.get(url, headers=headers) as resp:
                 resp.raise_for_status()
                 html = await resp.text()
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
             tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        # Collapse blank lines
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        return "\n".join(lines)[: self.MAX_CHARS]
+        lines = [ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()]
+        return "\n".join(lines)[: self._MAX]
 
 
-# ──────────────────────────────────────────────
-# AI Engine
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  AI ENGINE
+# ═══════════════════════════════════════════════════════════
 class AIEngine:
-    """Orchestrates LLM calls: Groq primary → Gemini fallback + vision."""
+    """
+    Groq (primary text + Whisper STT) → Gemini (fallback text + vision).
+    Image generation delegated to ImageGenerator via Groq tool-calling.
+    """
 
     def __init__(self) -> None:
-        self._groq = AsyncGroq(api_key=GROQ_API_KEY)
+        self._groq    = AsyncGroq(api_key=GROQ_API_KEY)
         genai.configure(api_key=GEMINI_API_KEY)
-        self._gemini = genai.GenerativeModel(GEMINI_MODEL)
-        self._image_gen = ImageGenerator()
+        self._gemini  = genai.GenerativeModel(GEMINI_MODEL)
+        self._img_gen = ImageGenerator()
 
-    # ── Text via Groq ──────────────────────────
-    async def chat_groq(
-        self,
-        history: list[dict],
-        user_message: str,
-    ) -> tuple[str, dict | None]:
-        """
-        Returns (text_reply, tool_call_dict | None).
-        If the model requests a tool, text_reply will be empty and tool_call_dict populated.
-        """
+    # ── Groq text + tool-calling ───────────────────────────
+    async def _groq_chat(
+        self, history: list[dict], user_msg: str
+    ) -> tuple[str, Optional[dict]]:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-        messages.append({"role": "user", "content": user_message})
-
-        response = await self._groq.chat.completions.create(
+        messages.append({"role": "user", "content": user_msg})
+        resp = await self._groq.chat.completions.create(
             model=GROQ_TEXT_MODEL,
             messages=messages,
             tools=TOOLS,
@@ -249,81 +301,70 @@ class AIEngine:
             max_tokens=1024,
             temperature=0.7,
         )
-        choice = response.choices[0]
-        finish_reason = choice.finish_reason
-
-        if finish_reason == "tool_calls" and choice.message.tool_calls:
-            tool_call = choice.message.tool_calls[0]
+        choice = resp.choices[0]
+        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+            tc = choice.message.tool_calls[0]
             return "", {
-                "name": tool_call.function.name,
-                "arguments": json.loads(tool_call.function.arguments),
+                "name": tc.function.name,
+                "args": json.loads(tc.function.arguments),
             }
-
         return choice.message.content or "", None
 
-    # ── Text via Gemini (fallback) ─────────────
-    async def chat_gemini(self, history: list[dict], user_message: str) -> str:
-        # Convert history to Gemini format
-        gemini_history = []
-        for msg in history:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
+    # ── Gemini text (fallback) ─────────────────────────────
+    async def _gemini_chat(self, history: list[dict], user_msg: str) -> str:
+        gemini_hist = [
+            {
+                "role": "user" if m["role"] == "user" else "model",
+                "parts": [m["content"]],
+            }
+            for m in history
+        ]
+        chat = self._gemini.start_chat(history=gemini_hist)
+        resp = await asyncio.to_thread(
+            chat.send_message, f"{SYSTEM_PROMPT}\n\n{user_msg}"
+        )
+        return resp.text
 
-        chat = self._gemini.start_chat(history=gemini_history)
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{user_message}"
-        response = await asyncio.to_thread(chat.send_message, full_prompt)
-        return response.text
-
-    # ── Vision via Gemini ──────────────────────
-    async def analyze_image(self, image_bytes: bytes, caption: str | None) -> str:
-        question = caption or "صف هذه الصورة بالتفصيل بالعربية."
-        prompt_parts = [
+    # ── Gemini vision ──────────────────────────────────────
+    async def analyze_image(self, image_bytes: bytes, caption: Optional[str]) -> str:
+        question = caption or "صف هذه الصورة بالتفصيل باللغة العربية."
+        parts = [
             question,
             {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()},
         ]
-        response = await asyncio.to_thread(self._gemini.generate_content, prompt_parts)
-        return response.text
+        resp = await asyncio.to_thread(self._gemini.generate_content, parts)
+        return resp.text
 
-    # ── Voice via Groq Whisper ─────────────────
-    async def transcribe_voice(self, audio_bytes: bytes, filename: str = "voice.ogg") -> str:
-        transcription = await self._groq.audio.transcriptions.create(
+    # ── Groq Whisper STT ───────────────────────────────────
+    async def transcribe(self, audio: bytes, filename: str = "voice.ogg") -> str:
+        result = await self._groq.audio.transcriptions.create(
             model=GROQ_WHISPER_MODEL,
-            file=(filename, audio_bytes),
+            file=(filename, audio),
             response_format="text",
         )
-        return transcription
+        return result  # type: ignore[return-value]
 
-    # ── Image Generation ───────────────────────
-    async def generate_image(self, prompt: str) -> bytes:
-        return await self._image_gen.generate(prompt)
-
-    # ── Master reply method ────────────────────
-    async def get_reply(
-        self,
-        history: list[dict],
-        user_message: str,
-    ) -> tuple[str, bytes | None]:
-        """
-        High-level method that attempts Groq first, falls back to Gemini.
-        Returns (text_reply, image_bytes | None).
-        """
-        image_bytes: bytes | None = None
+    # ── Master reply (Groq → Gemini fallback) ──────────────
+    async def reply(
+        self, history: list[dict], user_msg: str
+    ) -> tuple[str, Optional[bytes]]:
+        tool_call: Optional[dict] = None
+        image_bytes: Optional[bytes] = None
 
         try:
-            text, tool_call = await self.chat_groq(history, user_message)
+            text, tool_call = await self._groq_chat(history, user_msg)
         except Exception as exc:
-            logger.warning("Groq failed (%s), falling back to Gemini.", exc)
+            logger.warning("Groq failed (%s) — trying Gemini.", exc)
             try:
-                text = await self.chat_gemini(history, user_message)
-                tool_call = None
+                text = await self._gemini_chat(history, user_msg)
             except Exception as exc2:
-                logger.error("Gemini also failed: %s", exc2)
+                logger.error("Gemini fallback also failed: %s", exc2)
                 return "عذراً، واجهت مشكلة تقنية. حاول مجدداً لاحقاً.", None
 
         if tool_call and tool_call["name"] == "generate_image":
-            prompt = tool_call["arguments"].get("prompt", user_message)
+            prompt = tool_call["args"].get("prompt", user_msg)
             try:
-                image_bytes = await self.generate_image(prompt)
+                image_bytes = await self._img_gen.generate(prompt)
                 text = f"✅ تم توليد الصورة بناءً على: _{prompt}_"
             except Exception as exc:
                 logger.error("Image generation failed: %s", exc)
@@ -332,130 +373,114 @@ class AIEngine:
         return text, image_bytes
 
 
-# ──────────────────────────────────────────────
-# Bot Handler (Router)
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  BOT HANDLER  (Aiogram 3.x Router)
+# ═══════════════════════════════════════════════════════════
 class BotHandler:
-    """Registers all Telegram message handlers."""
-
-    URL_RE = re.compile(r"https?://[^\s]+")
+    _URL_RE = re.compile(r"https?://\S+")
 
     def __init__(
-        self,
-        db: DatabaseManager,
-        ai: AIEngine,
-        scraper: WebScraper,
+        self, db: DatabaseManager, ai: AIEngine, scraper: WebScraper
     ) -> None:
-        self._db = db
-        self._ai = ai
+        self._db      = db
+        self._ai      = ai
         self._scraper = scraper
-        self.router = Router()
-        self._register_handlers()
+        self.router   = Router()
+        self._register()
 
-    def _register_handlers(self) -> None:
-        self.router.message(CommandStart())(self.handle_start)
-        self.router.message(F.voice)(self.handle_voice)
-        self.router.message(F.photo)(self.handle_photo)
-        self.router.message(F.text)(self.handle_text)
+    def _register(self) -> None:
+        self.router.message(CommandStart())(self._start)
+        self.router.message(F.voice)(self._voice)
+        self.router.message(F.photo)(self._photo)
+        self.router.message(F.text)(self._text)
 
-    # ── /start ─────────────────────────────────
-    async def handle_start(self, message: Message) -> None:
-        await message.answer(
+    # /start ───────────────────────────────────────────────
+    async def _start(self, msg: Message) -> None:
+        await msg.answer(
             "👋 أهلاً! أنا *زكي*، مساعدك الذكي.\n\n"
             "يمكنك:\n"
             "• 💬 مراسلتي بالنص\n"
             "• 🎤 إرسال رسائل صوتية\n"
             "• 🖼️ إرسال صور لتحليلها\n"
-            "• 🎨 طلب توليد صور بالكتابة\n"
+            "• 🎨 طلب توليد صور (مثال: ارسم قطة)\n"
             "• 🔗 إرسال روابط لتلخيصها",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    # ── Voice ──────────────────────────────────
-    async def handle_voice(self, message: Message, bot: Bot) -> None:
-        voice: Voice = message.voice  # type: ignore[assignment]
-        await message.answer("🎧 جارٍ تحويل الصوت إلى نص...")
-
+    # Voice ────────────────────────────────────────────────
+    async def _voice(self, msg: Message, bot: Bot) -> None:
+        voice: Voice = msg.voice  # type: ignore[assignment]
+        await msg.answer("🎧 جارٍ تحويل الصوت إلى نص...")
         file = await bot.get_file(voice.file_id)
-        buf = await bot.download_file(file.file_path)  # type: ignore[arg-type]
+        buf  = await bot.download_file(file.file_path)  # type: ignore[arg-type]
         audio_bytes = buf.read()  # type: ignore[union-attr]
-
         try:
-            transcribed = await self._ai.transcribe_voice(audio_bytes)
-        except Exception as exc:
-            logger.error("Transcription error: %s", exc)
-            await message.answer("❌ تعذّر تحويل الصوت. حاول مرة أخرى.")
+            text = await self._ai.transcribe(audio_bytes)
+        except Exception:
+            logger.error("Transcription error:\n%s", traceback.format_exc())
+            await msg.answer("❌ تعذّر تحويل الصوت. حاول مرة أخرى.")
             return
+        await msg.answer(
+            f"📝 *النص المُستخرج:*\n{text}", parse_mode=ParseMode.MARKDOWN
+        )
+        await self._process(msg, text)
 
-        await message.answer(f"📝 *النص المُستخرج:*\n{transcribed}", parse_mode=ParseMode.MARKDOWN)
-        await self._process_text(message, transcribed)
-
-    # ── Photo ──────────────────────────────────
-    async def handle_photo(self, message: Message, bot: Bot) -> None:
-        await message.answer("🔍 جارٍ تحليل الصورة...")
-
-        # Use the highest-resolution variant
-        photo = message.photo[-1]  # type: ignore[index]
-        file = await bot.get_file(photo.file_id)
-        buf = await bot.download_file(file.file_path)  # type: ignore[arg-type]
+    # Photo ────────────────────────────────────────────────
+    async def _photo(self, msg: Message, bot: Bot) -> None:
+        await msg.answer("🔍 جارٍ تحليل الصورة...")
+        photo = msg.photo[-1]  # type: ignore[index]
+        file  = await bot.get_file(photo.file_id)
+        buf   = await bot.download_file(file.file_path)  # type: ignore[arg-type]
         image_bytes = buf.read()  # type: ignore[union-attr]
-
-        caption = message.caption
-
         try:
-            analysis = await self._ai.analyze_image(image_bytes, caption)
-        except Exception as exc:
-            logger.error("Vision error: %s", exc)
-            await message.answer("❌ تعذّر تحليل الصورة. حاول مرة أخرى.")
+            analysis = await self._ai.analyze_image(image_bytes, msg.caption)
+        except Exception:
+            logger.error("Vision error:\n%s", traceback.format_exc())
+            await msg.answer("❌ تعذّر تحليل الصورة. حاول مرة أخرى.")
             return
+        uid = msg.from_user.id  # type: ignore[union-attr]
+        await self._db.append_message(uid, "user", f"[صورة] {msg.caption or ''}")
+        await self._db.append_message(uid, "assistant", analysis)
+        await msg.answer(analysis)
 
-        user_id = message.from_user.id  # type: ignore[union-attr]
-        await self._db.append_message(user_id, "user", f"[صورة] {caption or ''}")
-        await self._db.append_message(user_id, "assistant", analysis)
+    # Text ─────────────────────────────────────────────────
+    async def _text(self, msg: Message) -> None:
+        await self._process(msg, msg.text or "")
 
-        await message.answer(analysis)
+    # Core pipeline ────────────────────────────────────────
+    async def _process(self, msg: Message, user_input: str) -> None:
+        uid      = msg.from_user.id  # type: ignore[union-attr]
+        enriched = await self._enrich(user_input)
+        history  = await self._db.get_history(uid)
 
-    # ── Text ───────────────────────────────────
-    async def handle_text(self, message: Message) -> None:
-        text: str = message.text or ""
-        await self._process_text(message, text)
-
-    # ── Core processing pipeline ───────────────
-    async def _process_text(self, message: Message, user_input: str) -> None:
-        user_id = message.from_user.id  # type: ignore[union-attr]
-
-        # Enrich input with scraped content if URLs are present
-        enriched_input = await self._enrich_with_urls(user_input)
-
-        # Retrieve history and get AI reply
-        history = await self._db.get_history(user_id)
-
-        typing_task = asyncio.create_task(self._keep_typing(message))
+        typing = asyncio.create_task(self._keep_typing(msg))
         try:
-            reply_text, image_bytes = await self._ai.get_reply(history, enriched_input)
+            reply_text, image_bytes = await self._ai.reply(history, enriched)
         finally:
-            typing_task.cancel()
+            typing.cancel()
+            try:
+                await typing
+            except asyncio.CancelledError:
+                pass
 
-        # Persist conversation
-        await self._db.append_message(user_id, "user", user_input)
-        await self._db.append_message(user_id, "assistant", reply_text)
+        await self._db.append_message(uid, "user", user_input)
+        await self._db.append_message(uid, "assistant", reply_text)
 
-        # Send response
         if image_bytes:
-            await message.answer_photo(
-                BufferedInputFile(image_bytes, filename="image.jpg"),
+            await msg.answer_photo(
+                BufferedInputFile(image_bytes, "image.jpg"),
                 caption=reply_text,
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
-            await message.answer(reply_text, parse_mode=ParseMode.MARKDOWN)
+            await msg.answer(reply_text, parse_mode=ParseMode.MARKDOWN)
 
-    async def _enrich_with_urls(self, text: str) -> str:
-        urls = self.URL_RE.findall(text)
+    async def _enrich(self, text: str) -> str:
+        urls = self._URL_RE.findall(text)
         if not urls:
             return text
         parts = [text]
-        for url in urls[:2]:  # limit to 2 URLs per message
+        for url in urls[:2]:
             try:
                 content = await self._scraper.fetch(url)
                 parts.append(f"\n\n[محتوى الرابط {url}]:\n{content}")
@@ -464,96 +489,109 @@ class BotHandler:
         return "".join(parts)
 
     @staticmethod
-    async def _keep_typing(message: Message) -> None:
-        """Sends 'typing' action repeatedly while AI is processing."""
+    async def _keep_typing(msg: Message) -> None:
         try:
             while True:
-                await message.answer_chat_action("typing")
+                await msg.answer_chat_action("typing")
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
 
 
-# ──────────────────────────────────────────────
-# Health Check Web Server
-# ──────────────────────────────────────────────
-class HealthServer:
-    """
-    Minimal aiohttp web server for Render health checks.
-
-    Render sets the PORT environment variable dynamically. The server MUST
-    bind to that port or Render's health-check probe will time out and the
-    service will be killed. We read PORT once at module level (HEALTH_PORT)
-    and pass it in here so the binding is consistent.
-    """
-
-    def __init__(self, port: int = HEALTH_PORT) -> None:
-        self._port = port
-        self._app = web.Application()
-        self._app.router.add_get("/", self._handle)
-        self._app.router.add_get("/health", self._handle)
-
-    @staticmethod
-    async def _handle(request: web.Request) -> web.Response:  # noqa: ARG004
-        return web.json_response({"status": "ok", "bot": "زكي"})
-
-    async def start(self) -> None:
-        """Set up the runner and start listening. Safe to await from a task."""
-        runner = web.AppRunner(self._app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self._port)
-        await site.start()
-        logger.info("✅ Health server listening on 0.0.0.0:%d", self._port)
-
-
-# ──────────────────────────────────────────────
-# Application Bootstrap
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  APPLICATION  — startup sequencer + graceful shutdown
+# ═══════════════════════════════════════════════════════════
 class Application:
-    """Top-level orchestrator that wires all components together."""
+    """
+    Startup sequence (order matters for Render):
+    ┌─────────────────────────────────────────────────────┐
+    │ 1. HealthServer.start()  → port bound, probe → 200  │
+    │ 2. DatabaseManager.connect() → ping, exit on fail   │
+    │ 3. delete_webhook()      → clean long-poll baseline  │
+    │ 4. start_polling()       → bot accepts messages      │
+    └─────────────────────────────────────────────────────┘
+
+    SIGTERM/SIGINT cancels the polling task and runs cleanup
+    so the process exits with code 0, not 1.
+    """
 
     def __init__(self) -> None:
-        self._db = DatabaseManager(MONGO_URL)
-        self._ai = AIEngine()
+        self._health  = HealthServer()
+        self._db      = DatabaseManager()
+        self._ai      = AIEngine()
         self._scraper = WebScraper()
-        self._handler = BotHandler(self._db, self._ai, self._scraper)
+        handler       = BotHandler(self._db, self._ai, self._scraper)
+        self._bot     = Bot(token=BOT_TOKEN)
+        self._dp      = Dispatcher()
+        self._dp.include_router(handler.router)
+        self._poll_task: Optional[asyncio.Task] = None
 
-        self._bot = Bot(token=BOT_TOKEN)
-        self._dp = Dispatcher()
-        self._dp.include_router(self._handler.router)
+    # ── Signal handling ────────────────────────────────────
+    def _attach_signals(self, loop: asyncio.AbstractEventLoop) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: self._request_shutdown(s))
+            except NotImplementedError:
+                pass  # Windows — handled by KeyboardInterrupt at __main__
 
-        self._health = HealthServer()
+    def _request_shutdown(self, sig: signal.Signals) -> None:
+        logger.info("📶 Signal %s received — initiating graceful shutdown.", sig.name)
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
 
+    # ── Cleanup ────────────────────────────────────────────
+    async def _cleanup(self) -> None:
+        logger.info("🧹 Cleaning up resources...")
+        try:
+            await self._dp.stop_polling()
+        except Exception:
+            pass
+        try:
+            await self._bot.session.close()
+        except Exception:
+            pass
+        await self._db.close()
+        await self._health.stop()
+        logger.info("✅ Shutdown complete.")
+
+    # ── Main coroutine ─────────────────────────────────────
     async def run(self) -> None:
-        logger.info("🚀 Starting زكي bot...")
+        loop = asyncio.get_running_loop()
+        self._attach_signals(loop)
 
-        # 1. Verify MongoDB is reachable before accepting any traffic
+        # 1. Health server binds FIRST so Render's probe gets 200 immediately
+        await self._health.start()
+
+        # 2. MongoDB: verify with full traceback on failure, then exit cleanly
         await self._db.connect()
 
-        # 2. Start the health-check server as a background task so it is
-        #    immediately available to Render's probe while the bot initialises.
-        health_task = asyncio.create_task(self._health.start())
-        # Give the server a moment to bind before Render's first probe fires.
-        await asyncio.sleep(0.5)
-
-        # 3. Clear stale updates accumulated while the service was offline.
+        # 3. Clear stale Telegram updates from offline period
         await self._bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook cleared. Starting long-polling...")
+        logger.info("✅ Telegram webhook cleared. Bot is live — waiting for messages.")
 
-        # 4. Run the bot and the health server concurrently.
+        # 4. Start polling as a cancellable task
+        #    Health server stays alive via self._health._runner (not GC'd)
+        self._poll_task = asyncio.create_task(
+            self._dp.start_polling(self._bot, allowed_updates=["message"])
+        )
         try:
-            await asyncio.gather(
-                self._dp.start_polling(self._bot, allowed_updates=["message"]),
-                health_task,
+            await self._poll_task
+        except asyncio.CancelledError:
+            logger.info("⛔ Polling task cancelled.")
+        except Exception:
+            logger.critical(
+                "💥 Unhandled exception in polling loop:\n%s",
+                traceback.format_exc(),
             )
         finally:
-            logger.info("⛔ Shutting down — cleaning up resources.")
-            await self._db.close()
-            await self._bot.session.close()
+            await self._cleanup()
 
 
-# ──────────────────────────────────────────────
-# Entry Point
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    asyncio.run(Application().run())
+    try:
+        asyncio.run(Application().run())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Process exited cleanly.")
