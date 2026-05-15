@@ -71,7 +71,9 @@ GROQ_WHISPER_MODEL = "whisper-large-v3"
 GEMINI_MODEL = "gemini-1.5-flash"
 
 MAX_HISTORY = 15  # messages kept per user
-HEALTH_PORT = 8080
+
+# Render injects PORT dynamically; fall back to 8080 for local dev.
+HEALTH_PORT: int = int(os.getenv("PORT", "8080"))
 
 # ──────────────────────────────────────────────
 # System Prompt
@@ -119,9 +121,34 @@ class DatabaseManager:
     """Handles persistent conversation history via MongoDB (motor)."""
 
     def __init__(self, mongo_url: str) -> None:
-        self._client = AsyncIOMotorClient(mongo_url)
-        self._db = self._client["telegram_bot"]
-        self._collection = self._db["conversations"]
+        try:
+            self._client = AsyncIOMotorClient(
+                mongo_url,
+                serverSelectionTimeoutMS=5_000,  # fail fast on bad URLs
+            )
+            self._db = self._client["telegram_bot"]
+            self._collection = self._db["conversations"]
+            logger.info("✅ MongoDB client created. Connection will be verified at startup ping.")
+        except Exception as exc:
+            logger.critical(
+                "❌ Failed to create MongoDB client: %s  "
+                "Check your MONGO_URL environment variable on Render.",
+                exc,
+            )
+            raise
+
+    async def connect(self) -> None:
+        """Ping the server to verify the connection is alive at startup."""
+        try:
+            await self._client.admin.command("ping")
+            logger.info("✅ MongoDB connection verified — database is reachable.")
+        except Exception as exc:
+            logger.critical(
+                "❌ MongoDB ping failed: %s  "
+                "The bot will exit. Fix MONGO_URL on Render and redeploy.",
+                exc,
+            )
+            raise
 
     async def get_history(self, user_id: int) -> list[dict]:
         doc = await self._collection.find_one({"user_id": user_id})
@@ -451,7 +478,14 @@ class BotHandler:
 # Health Check Web Server
 # ──────────────────────────────────────────────
 class HealthServer:
-    """Minimal aiohttp server for Render uptime health checks."""
+    """
+    Minimal aiohttp web server for Render health checks.
+
+    Render sets the PORT environment variable dynamically. The server MUST
+    bind to that port or Render's health-check probe will time out and the
+    service will be killed. We read PORT once at module level (HEALTH_PORT)
+    and pass it in here so the binding is consistent.
+    """
 
     def __init__(self, port: int = HEALTH_PORT) -> None:
         self._port = port
@@ -464,11 +498,12 @@ class HealthServer:
         return web.json_response({"status": "ok", "bot": "زكي"})
 
     async def start(self) -> None:
+        """Set up the runner and start listening. Safe to await from a task."""
         runner = web.AppRunner(self._app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._port)
         await site.start()
-        logger.info("Health server listening on port %d", self._port)
+        logger.info("✅ Health server listening on 0.0.0.0:%d", self._port)
 
 
 # ──────────────────────────────────────────────
@@ -490,15 +525,29 @@ class Application:
         self._health = HealthServer()
 
     async def run(self) -> None:
-        logger.info("Starting زكي bot...")
-        await self._health.start()
+        logger.info("🚀 Starting زكي bot...")
 
-        # Drop pending updates accumulated while offline
+        # 1. Verify MongoDB is reachable before accepting any traffic
+        await self._db.connect()
+
+        # 2. Start the health-check server as a background task so it is
+        #    immediately available to Render's probe while the bot initialises.
+        health_task = asyncio.create_task(self._health.start())
+        # Give the server a moment to bind before Render's first probe fires.
+        await asyncio.sleep(0.5)
+
+        # 3. Clear stale updates accumulated while the service was offline.
         await self._bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook cleared. Starting long-polling...")
 
+        # 4. Run the bot and the health server concurrently.
         try:
-            await self._dp.start_polling(self._bot, allowed_updates=["message"])
+            await asyncio.gather(
+                self._dp.start_polling(self._bot, allowed_updates=["message"]),
+                health_task,
+            )
         finally:
+            logger.info("⛔ Shutting down — cleaning up resources.")
             await self._db.close()
             await self._bot.session.close()
 
